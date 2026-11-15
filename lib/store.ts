@@ -153,9 +153,18 @@ export class Store {
   }
 }
 
+const nodeIdCache = new Map<string, string>();
+
 /** A GitHub-style node id: base64 of '<Type><database id>', as the API hands out. */
 export function nodeId(type: string, databaseId: number): string {
-  return Buffer.from(`${type}${databaseId}`, 'utf8').toString('base64');
+  // The same ids are rendered on every read of the same object; memoize the
+  // base64 (bounded: a trial mints a bounded number of ids).
+  const key = `${type}${databaseId}`;
+  const cached = nodeIdCache.get(key);
+  if (cached !== undefined) return cached;
+  const id = Buffer.from(key, 'utf8').toString('base64');
+  if (nodeIdCache.size < 8192) nodeIdCache.set(key, id);
+  return id;
 }
 
 /** Parse a node id back to its type and database id, or null when it is not one of ours. */
