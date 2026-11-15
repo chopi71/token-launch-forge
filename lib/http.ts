@@ -16,13 +16,16 @@ export function sendJson(
 ): void {
   requestSeq += 1;
   const text = body === undefined ? '' : `${JSON.stringify(body)}\n`;
+  // Encode once, here: the byte length is then free, and the socket writes raw
+  // bytes instead of re-encoding the string on its way out.
+  const data = Buffer.from(text, 'utf8');
   res.writeHead(status, {
     'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
+    'content-length': data.length,
     'x-github-request-id': `F0RGE-${requestSeq.toString(16).toUpperCase().padStart(6, '0')}`,
     ...headers,
   });
-  res.end(text);
+  res.end(data);
 }
 
 export function sendRaw(
@@ -54,7 +57,7 @@ export function readBody(req: IncomingMessage, cap = 256 * 1024 * 1024): Promise
       }
       parts.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(parts)));
+    req.on('end', () => resolve(parts.length === 1 ? (parts[0] as Buffer) : Buffer.concat(parts)));
     req.on('error', reject);
   });
 }
@@ -63,15 +66,23 @@ export function readBody(req: IncomingMessage, cap = 256 * 1024 * 1024): Promise
 export function presentedToken(req: IncomingMessage): string | null {
   const header = req.headers.authorization;
   if (typeof header !== 'string') return null;
-  const match = /^[Bb]earer\s+(.+)$/.exec(header.trim());
-  return match === null ? null : (match[1] as string);
+  const trimmed = header.trim();
+  const first = trimmed.charCodeAt(0);
+  if ((first !== 0x42 && first !== 0x62) || trimmed.slice(1, 6) !== 'earer') return null;
+  let at = 6;
+  while (at < trimmed.length && (trimmed[at] === ' ' || trimmed[at] === '\t')) at += 1;
+  if (at >= trimmed.length) return null;
+  return trimmed.slice(at);
 }
+
+let expectedToken: string | null = null;
 
 /** True when the request carries exactly the shop token this process was given. */
 export function authorized(req: IncomingMessage): boolean {
-  const expected = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  // The token is fixed by the environment before the process serves; read it once.
+  if (expectedToken === null) expectedToken = process.env.MAKEFUN_SHOP_TOKEN ?? '';
   const presented = presentedToken(req);
-  return presented !== null && presented === expected;
+  return presented !== null && presented === expectedToken;
 }
 
 /** Parse a JSON request body; {ok:false} for malformed JSON, which the contract answers 400. */
