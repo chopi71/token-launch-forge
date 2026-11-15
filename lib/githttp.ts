@@ -210,11 +210,28 @@ function fetchObjectSet(
     }
   }
   // The pack: window commits the client lacks, their trees and blobs, plus any non-commit
-  // wants (tags) with their closure — minus everything already held.
+  // wants (tags) with their closure — minus everything already held. The tree closure is
+  // walked per window commit WITHOUT following parents: a parent outside the window is
+  // the shallow boundary, not pack content. (An earlier version walked the commits' full
+  // ancestry here and shipped every ancestor's trees and blobs in a depth-1 pack.)
   const pack = new Set<string>();
-  for (const sha of window) if (!held.has(sha)) pack.add(sha);
-  for (const sha of graftedReachable(store, [...pack], new Set())) {
-    if (!held.has(sha) && (window.has(sha) || store.get(sha)?.type !== 'commit')) pack.add(sha);
+  const addTreeClosure = (treeSha: string): void => {
+    if (pack.has(treeSha) || held.has(treeSha)) return;
+    const obj = store.get(treeSha);
+    if (obj === undefined || obj.type !== 'tree') return;
+    pack.add(treeSha);
+    for (const entry of parseTree(obj.data)) {
+      const child = store.get(entry.sha);
+      if (child === undefined || held.has(entry.sha)) continue;
+      if (child.type === 'tree') addTreeClosure(entry.sha);
+      else pack.add(entry.sha);
+    }
+  };
+  for (const sha of window) {
+    if (held.has(sha)) continue;
+    pack.add(sha);
+    const obj = store.get(sha);
+    if (obj !== undefined && obj.type === 'commit') addTreeClosure(parseCommit(obj.data).tree);
   }
   for (const want of wants) {
     if (store.get(want)?.type !== 'commit') {
@@ -405,13 +422,16 @@ async function handleReceivePack(store: Store, req: IncomingMessage, res: Server
   const wantsSideBand = capabilities.includes('side-band-64k');
   const wantsReport = capabilities.includes('report-status');
 
-  // The merged object view: the repository plus everything the pack carries.
-  const merged = new Map(repo.objects);
+  // Persist the pack's objects straight into the repository: ancestry checks below read
+  // them there, and git keeps the objects even when a ref update is refused. (An earlier
+  // version merged through a full copy of the object map on every push — O(store) per push.)
   let unpackError: string | null = null;
   if (packBytes.length > 0) {
     try {
       const parsed = parsePack(repo.objects, packBytes);
-      for (const [sha, obj] of parsed.objects) merged.set(sha, obj);
+      for (const [sha, obj] of parsed.objects) {
+        if (!repo.objects.has(sha)) repo.objects.set(sha, obj);
+      }
     } catch (err) {
       unpackError = err instanceof Error ? err.message : 'unpack failed';
     }
@@ -421,12 +441,7 @@ async function handleReceivePack(store: Store, req: IncomingMessage, res: Server
   if (unpackError !== null) {
     for (const command of commands) results.push({ ref: command.ref, ok: false, reason: `unpacker error: ${unpackError}` });
   } else {
-    // Persist the pack's objects first: ancestry checks below read the merged view either way,
-    // and git keeps the objects even when a ref update is refused.
-    for (const [sha, obj] of merged) {
-      if (!repo.objects.has(sha)) repo.objects.set(sha, obj);
-    }
-    const mergedStore: Map<string, GitObject> = merged;
+    const mergedStore: Map<string, GitObject> = repo.objects;
     for (const command of commands) {
       const current = repo.refs.get(command.ref) ?? ZERO_SHA;
       if (command.newSha === ZERO_SHA) {
