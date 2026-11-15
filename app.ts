@@ -13,22 +13,27 @@ import { handleMcp } from './lib/mcp.ts';
 import { authorized, sendJson } from './lib/http.ts';
 
 function pathSegments(req: IncomingMessage): { segments: string[]; query: URLSearchParams } {
-  try {
-    const url = new URL(req.url ?? '/', 'http://entry');
-    const segments = url.pathname
-      .split('/')
-      .filter((part) => part !== '')
-      .map((part) => {
-        try {
-          return decodeURIComponent(part);
-        } catch {
-          return part;
-        }
-      });
-    return { segments, query: url.searchParams };
-  } catch {
-    return { segments: [], query: new URLSearchParams() };
+  // Split the request target by hand: the WHATWG URL parser is the single most
+  // expensive line in the request path, and the suite's targets are plain
+  // '/'-joined paths with an optional query string.
+  const target = req.url ?? '/';
+  const queryAt = target.indexOf('?');
+  const pathname = queryAt === -1 ? target : target.slice(0, queryAt);
+  const query = new URLSearchParams(queryAt === -1 ? '' : target.slice(queryAt + 1));
+  const segments: string[] = [];
+  for (const part of pathname.split('/')) {
+    if (part === '') continue;
+    if (part.includes('%')) {
+      try {
+        segments.push(decodeURIComponent(part));
+        continue;
+      } catch {
+        // fall through: keep the raw segment
+      }
+    }
+    segments.push(part);
   }
+  return { segments, query };
 }
 
 function originOf(req: IncomingMessage): string {
