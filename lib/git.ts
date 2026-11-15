@@ -336,7 +336,7 @@ export function parsePack(store: ObjectStore, pack: Buffer): ParsedPack {
         at += 1;
         baseOffset = ((baseOffset + 1) << 7) | (b & 0x7f);
       }
-      const compressed = readInflated(pack, at);
+      const compressed = readInflated(pack, at, size);
       at += compressed.consumed;
       const base = byOffset.get(offset - baseOffset);
       if (base === undefined) throw new Error('ofs-delta base missing from pack');
@@ -345,13 +345,13 @@ export function parsePack(store: ObjectStore, pack: Buffer): ParsedPack {
       // REF_DELTA: the base is named by sha; it may sit in this pack or in the store.
       const baseSha = pack.toString('hex', at, at + 20);
       at += 20;
-      const compressed = readInflated(pack, at);
+      const compressed = readInflated(pack, at, size);
       at += compressed.consumed;
       pendingRef.push({ baseSha, delta: compressed.data, offset });
     } else {
       const type = ID_TYPES[typeId];
       if (type === undefined) throw new Error(`unknown pack object type ${typeId}`);
-      const compressed = readInflated(pack, at);
+      const compressed = readInflated(pack, at, size);
       at += compressed.consumed;
       if (compressed.data.length !== size) throw new Error('pack object size mismatch');
       record(offset, { type, data: compressed.data });
@@ -374,12 +374,34 @@ export function parsePack(store: ObjectStore, pack: Buffer): ParsedPack {
   return { objects, count };
 }
 
+/** Adler-32 of `data`, as the zlib stream trailer carries it (big-endian). */
+function adler32(data: Buffer): number {
+  let a = 1;
+  let b = 0;
+  let at = 0;
+  while (at < data.length) {
+    const end = Math.min(at + 5552, data.length);
+    for (let i = at; i < end; i += 1) {
+      a += data[i] as number;
+      b += a;
+    }
+    a %= 65521;
+    b %= 65521;
+    at = end;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
 /**
  * Inflate one zlib stream starting at `at`; report the raw bytes and how much input it used.
- * inflateSync tolerates trailing bytes but fails on a truncated stream, so the stream's end is
- * the shortest slice that inflates: exponential search for a working bound, then binary search.
+ * Fast path: one inflate at an upper bound for the compressed length (deflate's stored-block
+ * worst case over the known plain size), then locate the stream's exact end from its Adler-32
+ * trailer and confirm with a second inflate at that length — two inflates per object instead
+ * of a search's worth. Anything unexpected falls back to the original search: exponential
+ * growth for a working bound, then binary search for the shortest slice that inflates
+ * (inflateSync tolerates trailing bytes but fails on a truncated stream).
  */
-function readInflated(pack: Buffer, at: number): { data: Buffer; consumed: number } {
+function readInflated(pack: Buffer, at: number, size: number): { data: Buffer; consumed: number } {
   const rest = pack.subarray(at);
   const inflates = (length: number): Buffer | null => {
     try {
@@ -388,6 +410,19 @@ function readInflated(pack: Buffer, at: number): { data: Buffer; consumed: numbe
       return null;
     }
   };
+  const bound = Math.min(rest.length, size + 16 + 5 * Math.ceil(size / 65535) + Math.ceil(size / 8));
+  const whole = bound > 0 ? inflates(bound) : null;
+  if (whole !== null && whole.length === size) {
+    const tail = Buffer.alloc(4);
+    tail.writeUInt32BE(adler32(whole), 0);
+    let idx = rest.indexOf(tail, 2);
+    while (idx !== -1 && idx + 4 <= bound) {
+      const consumed = idx + 4;
+      const check = inflates(consumed);
+      if (check !== null && check.equals(whole)) return { data: whole, consumed };
+      idx = rest.indexOf(tail, idx + 1);
+    }
+  }
   let hi = 1;
   let data = inflates(hi);
   while (data === null && hi < rest.length) {
