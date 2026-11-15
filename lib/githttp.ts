@@ -19,11 +19,19 @@ import { readBody, sendRaw } from './http.ts';
 
 // ---------------------------------------------------------------- pkt-lines
 
+const HEX_DIGITS = '0123456789abcdef';
+
 export function pktLine(payload: string | Buffer): Buffer {
   const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
   const length = data.length + 4;
-  const head = Buffer.from(length.toString(16).padStart(4, '0'), 'ascii');
-  return Buffer.concat([head, data]);
+  // One allocation: the 4-hex-digit length header written in place, then the payload.
+  const out = Buffer.allocUnsafe(length);
+  out[0] = HEX_DIGITS.charCodeAt((length >> 12) & 0xf);
+  out[1] = HEX_DIGITS.charCodeAt((length >> 8) & 0xf);
+  out[2] = HEX_DIGITS.charCodeAt((length >> 4) & 0xf);
+  out[3] = HEX_DIGITS.charCodeAt(length & 0xf);
+  data.copy(out, 4);
+  return out;
 }
 
 export const PKT_FLUSH = Buffer.from('0000', 'ascii');
@@ -34,14 +42,23 @@ export interface Pkt {
   data: Buffer;
 }
 
+function hexValue(byte: number): number {
+  if (byte >= 0x30 && byte <= 0x39) return byte - 0x30;
+  if (byte >= 0x61 && byte <= 0x66) return byte - 0x61 + 10;
+  return -1;
+}
+
 /** Parse pkt-lines from `buf` starting at `at`; returns the packets and the offset after them. */
 export function parsePkts(buf: Buffer, at = 0): { packets: Pkt[]; next: number } {
   const packets: Pkt[] = [];
   let offset = at;
   while (offset + 4 <= buf.length) {
-    const head = buf.toString('ascii', offset, offset + 4);
-    if (!/^[0-9a-f]{4}$/.test(head)) break;
-    const length = parseInt(head, 16);
+    const h0 = hexValue(buf[offset] as number);
+    const h1 = hexValue(buf[offset + 1] as number);
+    const h2 = hexValue(buf[offset + 2] as number);
+    const h3 = hexValue(buf[offset + 3] as number);
+    if (h0 < 0 || h1 < 0 || h2 < 0 || h3 < 0) break;
+    const length = (h0 << 12) | (h1 << 8) | (h2 << 4) | h3;
     if (length === 0) {
       packets.push({ kind: 'flush', data: Buffer.alloc(0) });
       offset += 4;
@@ -66,12 +83,23 @@ export function parsePkts(buf: Buffer, at = 0): { packets: Pkt[]; next: number }
 }
 
 function pktText(pkt: Pkt): string {
-  return pkt.data.toString('utf8').replace(/\n$/, '');
+  const text = pkt.data.toString('utf8');
+  return text.endsWith('\n') ? text.slice(0, -1) : text;
 }
 
 // ---------------------------------------------------------------- advertisements
 
 const AGENT = 'forge/1.0';
+
+/** The protocol v2 capability advertisement: constant bytes, built once. */
+const V2_ADVERTISEMENT = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine(`agent=${AGENT}\n`),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow wait-for-done filter\n'),
+  pktLine('object-format=sha1\n'),
+  PKT_FLUSH,
+]);
 
 function sortedRefNames(repo: Repo): string[] {
   return [...repo.refs.keys()].sort();
@@ -120,15 +148,7 @@ export function handleInfoRefs(
     return;
   }
   if (service === 'git-upload-pack' && isV2(req)) {
-    const body = Buffer.concat([
-      pktLine('version 2\n'),
-      pktLine(`agent=${AGENT}\n`),
-      pktLine('ls-refs=unborn\n'),
-      pktLine('fetch=shallow wait-for-done filter\n'),
-      pktLine('object-format=sha1\n'),
-      PKT_FLUSH,
-    ]);
-    sendRaw(res, 200, body, { 'content-type': 'application/x-git-upload-pack-advertisement' });
+    sendRaw(res, 200, V2_ADVERTISEMENT, { 'content-type': 'application/x-git-upload-pack-advertisement' });
     return;
   }
   const body = Buffer.concat([
